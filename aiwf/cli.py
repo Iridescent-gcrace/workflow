@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 import sqlite3
 import sys
-from pathlib import Path
 
 from aiwf.capture import read_clipboard, write_note_markdown
 from aiwf.config import APP_DIR, CONFIG_PATH, DB_PATH, LOG_DIR, NOTES_DIR, load_config, save_config
 from aiwf.db import connect_db, init_db, utc_now
 from aiwf.models import ModelError, ask_model
 from aiwf.papers import fetch_arxiv_entry
+from aiwf.remote import serve_remote
+from aiwf.review import gather_git_context, gather_task_context, review_loop, review_once
 from aiwf.tasks import refresh_tasks, start_task, tail_log
 from aiwf.utils import auto_title, normalize_tags, read_text
 
@@ -364,6 +366,125 @@ def cmd_status(_: argparse.Namespace, __: dict, conn: sqlite3.Connection) -> int
     return 0
 
 
+def cmd_dash(args: argparse.Namespace, __: dict, conn: sqlite3.Connection) -> int:
+    refresh_tasks(conn)
+    tips_count = conn.execute("SELECT COUNT(*) FROM tips").fetchone()[0]
+    captures_count = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+    papers_count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    running = conn.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('starting', 'running')").fetchone()[0]
+    print("[summary]")
+    print(f"tips={tips_count} captures={captures_count} papers={papers_count} running_tasks={running}")
+
+    task_rows = conn.execute(
+        """
+        SELECT id, name, status, started_at
+        FROM tasks
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+    print("\n[latest_tasks]")
+    _print_rows(task_rows, ["id", "name", "status", "started_at"])
+
+    capture_rows = conn.execute(
+        """
+        SELECT id, title, tags, created_at
+        FROM captures
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+    print("\n[latest_captures]")
+    _print_rows(capture_rows, ["id", "title", "tags", "created_at"])
+    return 0
+
+
+def _print_review_result(round_num: int, total: int, done: bool, summary: str, next_steps: list[str]) -> None:
+    print(f"[round {round_num}/{total}] done={done}")
+    print(f"summary: {summary}")
+    if next_steps:
+        print("next_steps:")
+        for item in next_steps:
+            print(f"- {item}")
+    print()
+
+
+def cmd_review_now(args: argparse.Namespace, cfg: dict, conn: sqlite3.Connection) -> int:
+    code_ctx = ""
+    if not args.no_code:
+        code_ctx = gather_git_context(max_chars=args.max_code_chars)
+    task_ctx = ""
+    if args.task_id:
+        task_ctx = gather_task_context(conn, task_id=args.task_id, log_lines=args.task_log_lines)
+
+    if not code_ctx and not task_ctx:
+        raise RuntimeError("没有可审查上下文。请移除 --no-code 或添加 --task-id。")
+
+    result = review_once(
+        cfg=cfg,
+        goal=args.goal,
+        profile=args.profile,
+        provider=args.provider,
+        model=args.model,
+        code_context=code_ctx,
+        task_context=task_ctx,
+    )
+    _print_review_result(1, 1, result.done, result.summary, result.next_steps)
+    if args.raw:
+        print("[raw]")
+        print(result.raw)
+    return 0
+
+
+def cmd_review_loop(args: argparse.Namespace, cfg: dict, conn: sqlite3.Connection) -> int:
+    def on_round(i: int, result) -> None:  # type: ignore[no-untyped-def]
+        _print_review_result(i, args.max_rounds, result.done, result.summary, result.next_steps)
+
+    done, history = review_loop(
+        conn=conn,
+        cfg=cfg,
+        goal=args.goal,
+        profile=args.profile,
+        provider=args.provider,
+        model=args.model,
+        interval_sec=args.interval,
+        max_rounds=args.max_rounds,
+        task_id=args.task_id or None,
+        log_lines=args.task_log_lines,
+        max_code_chars=args.max_code_chars,
+        on_round=on_round,
+    )
+    if done:
+        print("review_loop 结论: 已完成")
+        return 0
+    if history:
+        print("review_loop 结论: 未完成（达到最大轮询次数）")
+    else:
+        print("review_loop 未执行")
+    return 3
+
+
+def cmd_remote_token(args: argparse.Namespace, cfg: dict, __: sqlite3.Connection) -> int:
+    token = secrets.token_urlsafe(max(16, args.bytes))
+    print(token)
+    if args.save:
+        cfg.setdefault("remote", {})
+        cfg["remote"]["token"] = token
+        save_config(cfg)
+        print("token 已写入配置")
+    return 0
+
+
+def cmd_remote_serve(args: argparse.Namespace, cfg: dict, __: sqlite3.Connection) -> int:
+    token = args.token.strip() if args.token else str(cfg.get("remote", {}).get("token", "")).strip()
+    if not token:
+        raise RuntimeError("缺少 token。请使用 `wf rm t --save` 生成并保存，或在 `wf rm s --token ...` 传入。")
+    serve_remote(host=args.host, port=args.port, token=token)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aiwf",
@@ -371,26 +492,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="初始化目录和数据库")
+    p_init = sub.add_parser("init", aliases=["i"], help="初始化目录和数据库")
     p_init.set_defaults(func=cmd_init)
 
-    p_tip = sub.add_parser("tip", help="AI 使用技巧")
+    p_tip = sub.add_parser("tip", aliases=["k"], help="AI 使用技巧")
     tip_sub = p_tip.add_subparsers(dest="tip_cmd", required=True)
-    p_tip_add = tip_sub.add_parser("add", help="新增技巧")
+    p_tip_add = tip_sub.add_parser("add", aliases=["a"], help="新增技巧")
     p_tip_add.add_argument("--title", required=True)
     p_tip_add.add_argument("--content", required=True)
     p_tip_add.add_argument("--tags", default="")
     p_tip_add.set_defaults(func=cmd_tip_add)
 
-    p_tip_list = tip_sub.add_parser("list", help="查看技巧")
+    p_tip_list = tip_sub.add_parser("list", aliases=["l"], help="查看技巧")
     p_tip_list.add_argument("--tag", default="")
     p_tip_list.add_argument("--limit", type=int, default=50)
     p_tip_list.set_defaults(func=cmd_tip_list)
 
-    p_capture = sub.add_parser("capture", help="沉淀高价值对话")
+    p_capture = sub.add_parser("capture", aliases=["c"], help="沉淀高价值对话")
     capture_sub = p_capture.add_subparsers(dest="capture_cmd", required=True)
 
-    p_capture_add = capture_sub.add_parser("add", help="添加沉淀内容")
+    p_capture_add = capture_sub.add_parser("add", aliases=["a"], help="添加沉淀内容")
     p_capture_add.add_argument("--title", default="")
     p_capture_add.add_argument("--content", default="")
     p_capture_add.add_argument("--file", default="")
@@ -402,7 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_capture_add.add_argument("--model", default="")
     p_capture_add.set_defaults(func=cmd_capture_add)
 
-    p_capture_quick = capture_sub.add_parser("quick", help="一键沉淀（剪贴板）")
+    p_capture_quick = capture_sub.add_parser("quick", aliases=["q"], help="一键沉淀（剪贴板）")
     p_capture_quick.add_argument("--title", default="")
     p_capture_quick.add_argument("--tags", default="")
     p_capture_quick.add_argument("--no-note", action="store_true")
@@ -411,78 +532,132 @@ def build_parser() -> argparse.ArgumentParser:
     p_capture_quick.add_argument("--model", default="")
     p_capture_quick.set_defaults(func=cmd_capture_quick)
 
-    p_capture_list = capture_sub.add_parser("list", help="查看沉淀列表")
+    p_capture_list = capture_sub.add_parser("list", aliases=["l"], help="查看沉淀列表")
     p_capture_list.add_argument("--tag", default="")
     p_capture_list.add_argument("--limit", type=int, default=50)
     p_capture_list.set_defaults(func=cmd_capture_list)
 
-    p_capture_show = capture_sub.add_parser("show", help="查看沉淀详情")
+    p_capture_show = capture_sub.add_parser("show", aliases=["s"], help="查看沉淀详情")
     p_capture_show.add_argument("id", type=int)
     p_capture_show.set_defaults(func=cmd_capture_show)
 
-    p_ask = sub.add_parser("ask", help="调用模型问答")
+    p_capture_fast = sub.add_parser("x", help="一键沉淀（剪贴板，短命令）")
+    p_capture_fast.add_argument("--title", default="")
+    p_capture_fast.add_argument("--tags", default="")
+    p_capture_fast.add_argument("--no-note", action="store_true")
+    p_capture_fast.add_argument("--profile", default="deep")
+    p_capture_fast.add_argument("--provider", default="")
+    p_capture_fast.add_argument("--model", default="")
+    p_capture_fast.set_defaults(func=cmd_capture_quick)
+
+    p_ask = sub.add_parser("ask", aliases=["q"], help="调用模型问答")
     p_ask.add_argument("prompt")
     p_ask.add_argument("--profile", default="fast")
     p_ask.add_argument("--provider", default="")
     p_ask.add_argument("--model", default="")
     p_ask.set_defaults(func=cmd_ask)
 
-    p_profile = sub.add_parser("profile", help="管理模型路由")
+    p_profile = sub.add_parser("profile", aliases=["m"], help="管理模型路由")
     profile_sub = p_profile.add_subparsers(dest="profile_cmd", required=True)
 
-    p_profile_list = profile_sub.add_parser("list", help="列出 profile")
+    p_profile_list = profile_sub.add_parser("list", aliases=["l"], help="列出 profile")
     p_profile_list.set_defaults(func=cmd_profile_list)
 
-    p_profile_set = profile_sub.add_parser("set", help="设置 profile")
+    p_profile_set = profile_sub.add_parser("set", aliases=["s"], help="设置 profile")
     p_profile_set.add_argument("name")
     p_profile_set.add_argument("--provider", required=True)
     p_profile_set.add_argument("--model", required=True)
     p_profile_set.set_defaults(func=cmd_profile_set)
 
-    p_task = sub.add_parser("task", help="慢任务监控")
+    p_task = sub.add_parser("task", aliases=["j"], help="慢任务监控")
     task_sub = p_task.add_subparsers(dest="task_cmd", required=True)
 
-    p_task_start = task_sub.add_parser("start", help="启动后台任务")
+    p_task_start = task_sub.add_parser("start", aliases=["s"], help="启动后台任务")
     p_task_start.add_argument("--name", required=True)
     p_task_start.add_argument("--cmd", required=True)
     p_task_start.set_defaults(func=cmd_task_start)
 
-    p_task_list = task_sub.add_parser("list", help="查看任务列表")
+    p_task_list = task_sub.add_parser("list", aliases=["l"], help="查看任务列表")
     p_task_list.set_defaults(func=cmd_task_list)
 
-    p_task_refresh = task_sub.add_parser("refresh", help="刷新任务状态")
+    p_task_refresh = task_sub.add_parser("refresh", aliases=["r"], help="刷新任务状态")
     p_task_refresh.set_defaults(func=cmd_task_refresh)
 
-    p_task_logs = task_sub.add_parser("logs", help="查看任务日志")
+    p_task_logs = task_sub.add_parser("logs", aliases=["g"], help="查看任务日志")
     p_task_logs.add_argument("id", type=int)
     p_task_logs.add_argument("--lines", type=int, default=80)
     p_task_logs.set_defaults(func=cmd_task_logs)
 
-    p_paper = sub.add_parser("paper", help="论文工作流入口")
+    p_paper = sub.add_parser("paper", aliases=["p"], help="论文工作流入口")
     paper_sub = p_paper.add_subparsers(dest="paper_cmd", required=True)
 
-    p_paper_add = paper_sub.add_parser("add", help="手动添加论文")
+    p_paper_add = paper_sub.add_parser("add", aliases=["a"], help="手动添加论文")
     p_paper_add.add_argument("--title", required=True)
     p_paper_add.add_argument("--url", default="")
     p_paper_add.add_argument("--abstract", default="")
     p_paper_add.set_defaults(func=cmd_paper_add)
 
-    p_paper_arxiv = paper_sub.add_parser("arxiv", help="导入 arXiv 论文")
+    p_paper_arxiv = paper_sub.add_parser("arxiv", aliases=["x"], help="导入 arXiv 论文")
     p_paper_arxiv.add_argument("--id", required=True)
     p_paper_arxiv.set_defaults(func=cmd_paper_arxiv)
 
-    p_paper_list = paper_sub.add_parser("list", help="查看论文列表")
+    p_paper_list = paper_sub.add_parser("list", aliases=["l"], help="查看论文列表")
     p_paper_list.add_argument("--limit", type=int, default=50)
     p_paper_list.set_defaults(func=cmd_paper_list)
 
-    p_paper_summary = paper_sub.add_parser("summarize", help="总结论文摘要")
+    p_paper_summary = paper_sub.add_parser("summarize", aliases=["s"], help="总结论文摘要")
     p_paper_summary.add_argument("id", type=int)
     p_paper_summary.add_argument("--profile", default="deep")
     p_paper_summary.add_argument("--provider", default="")
     p_paper_summary.add_argument("--model", default="")
     p_paper_summary.set_defaults(func=cmd_paper_summarize)
 
-    p_status = sub.add_parser("status", help="查看工作流总览")
+    p_review = sub.add_parser("review", aliases=["rv"], help="AI 代码/任务审查")
+    review_sub = p_review.add_subparsers(dest="review_cmd", required=True)
+
+    p_review_now = review_sub.add_parser("now", aliases=["n"], help="执行一次 AI 审查")
+    p_review_now.add_argument("--goal", required=True)
+    p_review_now.add_argument("--task-id", type=int, default=0)
+    p_review_now.add_argument("--task-log-lines", type=int, default=120)
+    p_review_now.add_argument("--no-code", action="store_true")
+    p_review_now.add_argument("--max-code-chars", type=int, default=6000)
+    p_review_now.add_argument("--profile", default="deep")
+    p_review_now.add_argument("--provider", default="")
+    p_review_now.add_argument("--model", default="")
+    p_review_now.add_argument("--raw", action="store_true")
+    p_review_now.set_defaults(func=cmd_review_now)
+
+    p_review_loop = review_sub.add_parser("loop", aliases=["l"], help="持续轮询 AI 直到完成或超时")
+    p_review_loop.add_argument("--goal", required=True)
+    p_review_loop.add_argument("--task-id", type=int, default=0)
+    p_review_loop.add_argument("--task-log-lines", type=int, default=120)
+    p_review_loop.add_argument("--max-code-chars", type=int, default=6000)
+    p_review_loop.add_argument("--profile", default="deep")
+    p_review_loop.add_argument("--provider", default="")
+    p_review_loop.add_argument("--model", default="")
+    p_review_loop.add_argument("--interval", type=int, default=60)
+    p_review_loop.add_argument("--max-rounds", type=int, default=10)
+    p_review_loop.set_defaults(func=cmd_review_loop)
+
+    p_remote = sub.add_parser("remote", aliases=["rm"], help="手机远程访问 API")
+    remote_sub = p_remote.add_subparsers(dest="remote_cmd", required=True)
+
+    p_remote_token = remote_sub.add_parser("token", aliases=["t"], help="生成远程 token")
+    p_remote_token.add_argument("--bytes", type=int, default=24)
+    p_remote_token.add_argument("--save", action="store_true")
+    p_remote_token.set_defaults(func=cmd_remote_token)
+
+    p_remote_serve = remote_sub.add_parser("serve", aliases=["s"], help="启动远程服务")
+    p_remote_serve.add_argument("--host", default="0.0.0.0")
+    p_remote_serve.add_argument("--port", type=int, default=8787)
+    p_remote_serve.add_argument("--token", default="")
+    p_remote_serve.set_defaults(func=cmd_remote_serve)
+
+    p_dash = sub.add_parser("dash", aliases=["d"], help="终端仪表盘")
+    p_dash.add_argument("--limit", type=int, default=5)
+    p_dash.set_defaults(func=cmd_dash)
+
+    p_status = sub.add_parser("status", aliases=["st"], help="查看工作流总览")
     p_status.set_defaults(func=cmd_status)
     return parser
 
