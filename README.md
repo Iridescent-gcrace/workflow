@@ -102,25 +102,38 @@ wf review now --goal "当前任务是否可交付" --task-id 1
 wf review loop --goal "直到可交付为止" --task-id 1 --interval 60 --max-rounds 10
 ```
 
-## iTerm2 一键启动
+## 一键安装“当前对话沉淀”脚本（iTerm/Warp）
 
-先写入别名（`~/.zshrc`）：
+执行一次安装：
 
 ```bash
-alias wf='aiwf'
-alias wx='wf x --tags codex'
-alias wq='wf q'
-alias wd='wf d'
+bash scripts/install_onekey_capture.sh
+source ~/.zshrc
 ```
 
-然后在 iTerm2:
+安装后你会得到：
 
-1. `Preferences` -> `Profiles` -> `Keys`
-2. `+` 新增快捷键，比如 `Cmd+Shift+S`
-3. Action 选 `Send Text`
-4. Text 填 `wx\n`
+- `wfc`：一键沉淀当前终端对话
+- `wfs`：同上，但静默（不弹通知）
+- 可选全局热键：`Cmd+Shift+S`（由 `skhd` 提供）
 
-这样复制完内容，按一次快捷键就会沉淀。
+直接用：
+
+```bash
+wfc
+wfc --with-note
+```
+
+工作方式：
+
+- iTerm: 直接读取当前 session 的最近输出并沉淀
+- Warp: 自动触发 `Copy Outputs` 后沉淀（依赖 Warp 默认复制输出快捷键）
+
+只想安装命令，不安装全局热键：
+
+```bash
+bash scripts/install_onekey_capture.sh --no-hotkey
+```
 
 ## 手机远程下发任务
 
